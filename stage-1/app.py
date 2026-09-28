@@ -58,7 +58,7 @@ def obj(v):
     return v
 def string(v): return isinstance(v,str)
 def integer(v): return isinstance(v,int) and not isinstance(v,bool)
-def email_valid(s): return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",s))
+def email_valid(s): return bool(re.fullmatch(r"[^@\s]+@[^@\s]+",s))
 
 def local_instant(local, zone):
     try: naive=dt.datetime.strptime(local,"%Y-%m-%dT%H:%M")
@@ -72,36 +72,59 @@ def local_instant(local, zone):
     return aware
 
 def instant(s): return dt.datetime.fromisoformat(s)
+def local_end(start,minutes):
+    return (start.astimezone(dt.timezone.utc)+dt.timedelta(minutes=minutes)).astimezone(start.tzinfo)
 def same_date(value,date): return value[:10]==date
 
 def seed(c,data):
+    if not isinstance(data,dict): fail(400,"malformed_request","Expected a JSON object")
     users=data.get("users",[])
     restaurants=data.get("restaurants",[])
     if not isinstance(users,list) or not isinstance(restaurants,list): fail(422,"validation_failed","users and restaurants must be arrays")
     for u in users:
         if not isinstance(u,dict): fail(422,"validation_failed","Invalid user")
-        if not all(string(u.get(k)) for k in ("id","email","password","display_name")): fail(422,"validation_failed","Invalid user")
+        if not all(string(u.get(k)) for k in ("id","email","password","display_name")): fail(400,"malformed_request","Invalid user field types")
+        if len(u["id"])>64: fail(422,"validation_failed","ID is too long")
         if len(u["password"])<8 or not email_valid(u["email"]): fail(422,"validation_failed","Invalid user credentials")
         c.execute("INSERT INTO users VALUES(?,?,?,?)",(u["id"],u["email"],password_hash(u["password"]),u["display_name"]))
     for r in restaurants:
-        if not isinstance(r,dict) or not all(string(r.get(k)) for k in ("id","name","timezone")): fail(422,"validation_failed","Invalid restaurant")
+        if not isinstance(r,dict) or not all(string(r.get(k)) for k in ("id","name","timezone")): fail(400,"malformed_request","Invalid restaurant field types")
+        if len(r["id"])>64: fail(422,"validation_failed","ID is too long")
         try: ZoneInfo(r["timezone"])
         except ZoneInfoNotFoundError: fail(422,"validation_failed","Invalid timezone")
-        hours=r.get("opening_hours",{})
+        hours=r.get("opening_hours",[])
         tables=r.get("tables",[])
-        if not isinstance(hours,dict) or not isinstance(tables,list): fail(422,"validation_failed","Invalid restaurant configuration")
-        c.execute("INSERT INTO restaurants VALUES(?,?,?,?,?,?,?,?)",(r["id"],r["name"],r["timezone"],int(r.get("slot_minutes",30)),int(r.get("reservation_duration_minutes",90)),int(r.get("cancellation_cutoff_minutes",60)),canon(hours),canon(tables)))
-        if min(int(r.get("slot_minutes",30)),int(r.get("reservation_duration_minutes",90)))<1: fail(422,"validation_failed","Invalid restaurant configuration")
-    for b in data.get("reservations",[]):
+        if not isinstance(hours,list) or not isinstance(tables,list): fail(422,"validation_failed","Invalid restaurant configuration")
+        hmap={}
+        for h in hours:
+            if not isinstance(h,dict) or not string(h.get("weekday")) or h["weekday"] not in ("mon","tue","wed","thu","fri","sat","sun") or not string(h.get("opens")) or not string(h.get("closes")):
+                fail(422,"validation_failed","Invalid opening hours")
+            hmap[h["weekday"]]={"opens":h["opens"],"closes":h["closes"]}
+        for t in tables:
+            if not isinstance(t,dict) or not all(string(t.get(k)) for k in ("id","label")) or not integer(t.get("capacity")):
+                fail(400,"malformed_request","Invalid table field types")
+            if len(t["id"])>64:fail(422,"validation_failed","ID is too long")
+        try:
+            slot=int(r.get("slot_minutes",30));duration=int(r.get("reservation_duration_minutes",90));cutoff=int(r.get("cancellation_cutoff_minutes",60))
+        except Exception: fail(400,"malformed_request","Invalid restaurant configuration types")
+        if min(slot,duration)<1 or cutoff<0: fail(422,"validation_failed","Invalid restaurant configuration")
+        c.execute("INSERT INTO restaurants VALUES(?,?,?,?,?,?,?,?)",(r["id"],r["name"],r["timezone"],slot,duration,cutoff,canon(hmap),canon(tables)))
+    reservations=data.get("reservations",[])
+    if not isinstance(reservations,list):fail(400,"malformed_request","reservations must be an array")
+    for b in reservations:
         if not isinstance(b,dict): fail(422,"validation_failed","Invalid reservation fixture")
         user=c.execute("SELECT id FROM users WHERE id=?",(b.get("user_id"),)).fetchone()
         rest=c.execute("SELECT * FROM restaurants WHERE id=?",(b.get("restaurant_id"),)).fetchone()
         if not user or not rest: fail(422,"validation_failed","Invalid reservation fixture")
         table=next((t for t in json.loads(rest["tables_json"]) if t.get("id")==b.get("table_id")),None)
         if table is None: fail(422,"validation_failed","Invalid reservation fixture")
+        if not all(string(b.get(k)) for k in ("id","reference","starts_at_local")) or len(b.get("id",""))>64 or not string(b.get("reference")) or not 6<=len(b["reference"])<=12 or not re.fullmatch(r"[A-Z0-9]+",b["reference"]) or not integer(b.get("party_size")) or b["party_size"]<1:
+            fail(422,"validation_failed","Invalid reservation fixture")
         start=local_instant(b["starts_at_local"],rest["timezone"])
-        end=start.astimezone(dt.timezone.utc)+dt.timedelta(minutes=rest["reservation_duration_minutes"])
-        c.execute("INSERT INTO reservations VALUES(?,?,?,?,?,?,?,?,?,?,?)",(b.get("id",uuid.uuid4().hex),b["reference"],b["user_id"],b["restaurant_id"],b["table_id"],b.get("party_size",1),"confirmed",b["starts_at_local"],start.isoformat(),end.isoformat(),now()))
+        end=local_end(start,rest["reservation_duration_minutes"])
+        status=b.get("status","confirmed")
+        if status not in ("confirmed","cancelled"):fail(422,"validation_failed","Invalid reservation status")
+        c.execute("INSERT INTO reservations VALUES(?,?,?,?,?,?,?,?,?,?,?)",(b["id"],b["reference"],b["user_id"],b["restaurant_id"],b["table_id"],b["party_size"],status,b["starts_at_local"],start.isoformat(),end.isoformat(),b.get("created_at",now())))
 
 class Handler(BaseHTTPRequestHandler):
     server_version="Tablekeeper/1"
@@ -146,8 +169,8 @@ class Handler(BaseHTTPRequestHandler):
                     r=c.execute("SELECT * FROM restaurants WHERE id=?",(path.split("/")[-1],)).fetchone()
                     if not r: fail(404,"not_found","Restaurant not found")
                     return self.send_json(200,restaurant_view(r))
+                if method=="GET" and path=="/availability": return self.availability(c,None)
                 uid=self.auth(c)
-                if method=="GET" and path=="/availability": return self.availability(c,uid)
                 if method=="POST" and path=="/reservations":
                     b=self.body();return self.idempotent(c,uid,method,path,b,lambda:self.create_res(c,uid,b))
                 if method=="POST" and path=="/reservation-moves":
@@ -171,9 +194,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:self.send_json(500,{"error":{"code":"internal_error","message":"Internal server error"}})
     def auth_route(self,c,path,b):
         email,password,name=b.get("email"),b.get("password"),b.get("display_name")
-        if not all(string(x) for x in (email,password)) or (path.endswith("signup") and not string(name)): fail(422,"validation_failed","Invalid credentials")
+        if not all(string(x) for x in (email,password)) or (path.endswith("signup") and not string(name)): fail(400,"malformed_request","Invalid credentials field types")
         if path.endswith("signup"):
-            if not email_valid(email) or len(password)<8: fail(422,"validation_failed","Invalid email or password")
+            if not email_valid(email): fail(422,"validation_failed","Invalid email")
+            if len(password)<8: fail(422,"validation_failed","Password must contain at least 8 characters")
             if c.execute("SELECT 1 FROM users WHERE email=?",(email,)).fetchone(): fail(409,"email_taken","Email is already registered")
             uid=uuid.uuid4().hex;c.execute("INSERT INTO users VALUES(?,?,?,?)",(uid,email,password_hash(password),name))
         else:
@@ -185,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
     def idempotent(self,c,uid,method,path,b,fn):
         key=self.headers.get("Idempotency-Key")
         if key is None or key=="": fail(400,"missing_idempotency_key","Idempotency-Key is required")
-        if len(key)>255: fail(422,"validation_failed","Idempotency-Key is too long")
+        if not 1<=len(key)<=255: fail(422,"validation_failed","Idempotency-Key length must be 1 to 255")
         body=canon(b);row=c.execute("SELECT * FROM idem WHERE user_id=? AND ikey=?",(uid,key)).fetchone()
         if row:
             if row["method"]!=method or row["path"]!=path or row["body"]!=body: fail(409,"idempotency_key_reuse","Idempotency key was used for a different request")
@@ -219,7 +243,9 @@ class Handler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"[0-9]+",ps):fail(422,"validation_failed","party_size must be an integer")
         party=int(ps)
         if party<1:fail(422,"validation_failed","party_size must be positive")
-        try: dt.date.fromisoformat(date)
+        try:
+            parsed_date=dt.date.fromisoformat(date)
+            if parsed_date.isoformat()!=date:raise ValueError()
         except Exception: fail(422,"validation_failed","date must be YYYY-MM-DD")
         r=self.restaurant(c,rid);hours=json.loads(r["opening_hours"]);tables=json.loads(r["tables_json"]);zone=ZoneInfo(r["timezone"])
         wd=dt.date.fromisoformat(date).strftime("%a").lower()[:3]
@@ -230,12 +256,13 @@ class Handler(BaseHTTPRequestHandler):
             try:o=dt.datetime.strptime(op,"%H:%M").time();z=dt.datetime.strptime(cl,"%H:%M").time()
             except Exception:fail(422,"validation_failed","Invalid opening hours")
             cur=dt.datetime.combine(dt.date.fromisoformat(date),o);close=dt.datetime.combine(dt.date.fromisoformat(date),z)
+            open_min=o.hour*60+o.minute
             while cur+dt.timedelta(minutes=r["reservation_duration_minutes"])<=close:
                 local=cur.strftime("%Y-%m-%dT%H:%M")
                 # Exclude skipped wall-clock instants; keep first repeated instant only.
                 try:start=local_instant(local,r["timezone"])
                 except ApiError:cur+=dt.timedelta(minutes=r["slot_minutes"]);continue
-                end=start.astimezone(dt.timezone.utc)+dt.timedelta(minutes=r["reservation_duration_minutes"])
+                end=local_end(start,r["reservation_duration_minutes"])
                 free=[]
                 booked=list(c.execute("SELECT starts_at,ends_at,table_id FROM reservations WHERE restaurant_id=? AND status='confirmed'",(rid,)))
                 for t in tables:
@@ -254,6 +281,8 @@ class Handler(BaseHTTPRequestHandler):
         if not table:fail(404,"not_found","Table not found")
         local=b.get("starts_at_local",old["starts_at_local"] if old else None)
         if not string(local):fail(422,"validation_failed","starts_at_local is required")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}",local):
+            fail(422,"validation_failed","starts_at_local must be YYYY-MM-DDTHH:MM")
         start=local_instant(local,r["timezone"])
         party=b.get("party_size",old["party_size"] if old else None)
         if not integer(party) or party<1:fail(422,"validation_failed","party_size must be a positive integer")
@@ -263,8 +292,9 @@ class Handler(BaseHTTPRequestHandler):
         opening=dt.datetime.combine(start.date(),dt.datetime.strptime(h["opens"],"%H:%M").time(),start.tzinfo)
         close=dt.datetime.combine(start.date(),dt.datetime.strptime(h["closes"],"%H:%M").time(),start.tzinfo)
         if start<opening or start.astimezone(dt.timezone.utc)+dt.timedelta(minutes=r["reservation_duration_minutes"])>close.astimezone(dt.timezone.utc):fail(422,"outside_opening_hours","Reservation is outside opening hours")
-        if (start.hour*60+start.minute)%r["slot_minutes"]!=0:fail(422,"not_on_slot_grid","Start time is not on the slot grid")
-        end=start.astimezone(dt.timezone.utc)+dt.timedelta(minutes=r["reservation_duration_minutes"])
+        open_min=dt.datetime.strptime(h["opens"],"%H:%M").hour*60+dt.datetime.strptime(h["opens"],"%H:%M").minute
+        if (start.hour*60+start.minute-open_min)%r["slot_minutes"]!=0:fail(422,"not_on_slot_grid","Start time is not on the slot grid")
+        end=local_end(start,r["reservation_duration_minutes"])
         if check_occupancy:
             for x in c.execute("SELECT * FROM reservations WHERE restaurant_id=? AND table_id=? AND status='confirmed'",(rid,table_id)):
                 if old and x["id"]==old["id"]:continue
@@ -280,16 +310,17 @@ class Handler(BaseHTTPRequestHandler):
     def resview(self,r):
         return {k:r[k] for k in ("reservation_id","reference","restaurant_id","table_id","party_size","status","starts_at_local","starts_at","ends_at","created_at")} if "reservation_id" in r else {"reservation_id":r["id"],**{k:r[k] for k in ("reference","restaurant_id","table_id","party_size","status","starts_at_local","starts_at","ends_at","created_at")}}
     def cancel(self,c,uid,r):
-        if r["status"]=="canceled":return self.send_json(200,self.resview(r))
+        if r["status"]=="cancelled":return self.send_json(200,self.resview(r))
         rest=self.restaurant(c,r["restaurant_id"])
         if instant(r["starts_at"])-dt.datetime.now(dt.timezone.utc)<=dt.timedelta(minutes=rest["cancellation_cutoff_minutes"]):fail(409,"cutoff_passed","Cancellation cutoff has passed")
-        c.execute("UPDATE reservations SET status='canceled' WHERE id=?",(r["id"],))
+        c.execute("UPDATE reservations SET status='cancelled' WHERE id=?",(r["id"],))
+        c.commit()
         nr=c.execute("SELECT * FROM reservations WHERE id=?",(r["id"],)).fetchone();return self.send_json(200,self.resview(nr))
     def amend(self,c,uid,r,b):
         result=self.apply_amend(c,uid,r,b);c.commit()
         return self.send_json(200,result)
     def apply_amend(self,c,uid,r,b):
-        if r["status"]=="canceled":fail(409,"reservation_cancelled","Reservation is canceled")
+        if r["status"]=="cancelled":fail(409,"reservation_cancelled","Reservation is cancelled")
         rest=self.restaurant(c,r["restaurant_id"])
         if instant(r["starts_at"])-dt.datetime.now(dt.timezone.utc)<=dt.timedelta(minutes=rest["cancellation_cutoff_minutes"]):fail(409,"cutoff_passed","Amendment cutoff has passed")
         merged={k:b.get(k,r[k]) for k in ("restaurant_id","table_id","starts_at_local","party_size")}
@@ -312,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
         prepared=[];rest=self.restaurant(c,rows[0][0]["restaurant_id"])
         # Validate domain and cutoff precedence before occupancy, then check all final intervals jointly.
         for row,m in rows:
-            if row["status"]=="canceled":fail(409,"reservation_cancelled","Reservation is canceled")
+            if row["status"]=="cancelled":fail(409,"reservation_cancelled","Reservation is cancelled")
             if instant(row["starts_at"])-dt.datetime.now(dt.timezone.utc)<=dt.timedelta(minutes=rest["cancellation_cutoff_minutes"]):fail(409,"cutoff_passed","Amendment cutoff has passed")
             merged={k:m.get(k,row[k]) for k in ("restaurant_id","table_id","starts_at_local","party_size")}
             r,tid,p,local,start,end=self.validate_slot(c,uid,merged,row,check_occupancy=False)

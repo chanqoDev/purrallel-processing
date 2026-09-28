@@ -21,7 +21,7 @@ Check readiness with `curl http://localhost:8080/health`.
   "restaurants": [{
     "id":"r1","name":"Example","timezone":"Europe/Berlin",
     "slot_minutes":30,"reservation_duration_minutes":90,"cancellation_cutoff_minutes":60,
-    "opening_hours":{"mon":{"opens":"09:00","closes":"17:00"}},
+    "opening_hours":[{"weekday":"mon","opens":"09:00","closes":"17:00"}],
     "tables":[{"id":"t1","label":"Table 1","capacity":4}]
   }]
 }
