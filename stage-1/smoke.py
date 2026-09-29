@@ -27,6 +27,11 @@ assert status==201,payload
 reference=json.loads(payload)["reference"]
 replay_status,replay=request("/reservations","POST",{"restaurant_id":"r","table_id":"t","starts_at_local":"2026-09-29T10:00","party_size":2},{**auth,"Idempotency-Key":"smoke"})
 assert replay_status==200 and replay==payload,(replay_status,payload,replay)
+move_body={"moves":[{"reference":reference,"starts_at_local":"2026-09-29T10:30"}]}
+move_status,move_result=request("/reservation-moves","POST",move_body,{**auth,"Idempotency-Key":"move-smoke"})
+assert move_status==201,move_result
+move_replay_status,move_replay=request("/reservation-moves","POST",move_body,{**auth,"Idempotency-Key":"move-smoke"})
+assert move_replay_status==200 and move_replay==move_result,(move_replay_status,move_result,move_replay)
 assert request("/_test/export")[0]==200
 avail_status,avail=request("/availability?restaurant_id=r&date=2026-09-29&party_size=2")
 assert avail_status==200

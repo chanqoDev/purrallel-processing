@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tablekeeper Stage 1: dependency-free, single-process HTTP service."""
 import base64
+from contextlib import nullcontext
 import datetime as dt
 import hashlib
 import hmac
@@ -16,15 +17,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DB = os.environ.get("TABLEKEEPER_DB", "/tmp/tablekeeper.sqlite3")
 LOCK = threading.RLock()
+SCRYPT_N = 2**12
 
 def connect():
     c=sqlite3.connect(DB, timeout=5, check_same_thread=False)
     c.row_factory=sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA foreign_keys=ON")
     return c
 
 def schema(c):
+    c.execute("PRAGMA journal_mode=WAL")
     c.executescript("""
     CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE,password TEXT,display_name TEXT);
     CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id));
@@ -41,12 +43,19 @@ def canon(v):
 
 def password_hash(p):
     salt=secrets.token_bytes(16)
-    return "scrypt$"+base64.b64encode(salt).decode()+"$"+hashlib.scrypt(p.encode(),salt=salt,n=2**14,r=8,p=1).hex()
+    digest=hashlib.scrypt(p.encode(),salt=salt,n=SCRYPT_N,r=8,p=1)
+    return f"scrypt${SCRYPT_N}$"+base64.b64encode(salt).decode()+"$"+digest.hex()
 
 def password_ok(p, stored):
     try:
-        _,s,h=stored.split("$"); salt=base64.b64decode(s)
-        return hmac.compare_digest(hashlib.scrypt(p.encode(),salt=salt,n=2**14,r=8,p=1).hex(),h)
+        parts=stored.split("$")
+        if len(parts)==3: # hashes exported by the earlier Stage 1 image
+            _,s,h=parts;n=2**14
+        else:
+            _,n,s,h=parts;n=int(n)
+        if n not in (2**12,2**14):return False
+        salt=base64.b64decode(s)
+        return hmac.compare_digest(hashlib.scrypt(p.encode(),salt=salt,n=n,r=8,p=1).hex(),h)
     except Exception:return False
 
 class ApiError(Exception):
@@ -76,43 +85,63 @@ def local_end(start,minutes):
     return (start.astimezone(dt.timezone.utc)+dt.timedelta(minutes=minutes)).astimezone(start.tzinfo)
 def same_date(value,date): return value[:10]==date
 
+def hours_map(value):
+    if isinstance(value,list):
+        return {h["weekday"]:{"opens":h["opens"],"closes":h["closes"]} for h in value}
+    return value
+
+def hours_array(value):
+    if isinstance(value,list): return value
+    return [{"weekday":day,"opens":hours["opens"],"closes":hours["closes"]} for day,hours in value.items()]
+
 def seed(c,data):
     if not isinstance(data,dict): fail(400,"malformed_request","Expected a JSON object")
+    if "users" not in data or "restaurants" not in data: fail(422,"validation_failed","users and restaurants are required")
     users=data.get("users",[])
     restaurants=data.get("restaurants",[])
-    if not isinstance(users,list) or not isinstance(restaurants,list): fail(422,"validation_failed","users and restaurants must be arrays")
+    if not isinstance(users,list) or not isinstance(restaurants,list): fail(400,"malformed_request","users and restaurants must be arrays")
     for u in users:
-        if not isinstance(u,dict): fail(422,"validation_failed","Invalid user")
+        if not isinstance(u,dict): fail(400,"malformed_request","Invalid user object")
+        if any(k not in u for k in ("id","email","password","display_name")): fail(422,"validation_failed","Required user fields are missing")
         if not all(string(u.get(k)) for k in ("id","email","password","display_name")): fail(400,"malformed_request","Invalid user field types")
         if len(u["id"])>64: fail(422,"validation_failed","ID is too long")
         if len(u["password"])<8 or not email_valid(u["email"]): fail(422,"validation_failed","Invalid user credentials")
         c.execute("INSERT INTO users VALUES(?,?,?,?)",(u["id"],u["email"],password_hash(u["password"]),u["display_name"]))
     for r in restaurants:
-        if not isinstance(r,dict) or not all(string(r.get(k)) for k in ("id","name","timezone")): fail(400,"malformed_request","Invalid restaurant field types")
+        if not isinstance(r,dict): fail(400,"malformed_request","Invalid restaurant object")
+        if any(k not in r for k in ("id","name","timezone")): fail(422,"validation_failed","Required restaurant fields are missing")
+        if not all(string(r.get(k)) for k in ("id","name","timezone")): fail(400,"malformed_request","Invalid restaurant field types")
         if len(r["id"])>64: fail(422,"validation_failed","ID is too long")
         try: ZoneInfo(r["timezone"])
-        except ZoneInfoNotFoundError: fail(422,"validation_failed","Invalid timezone")
+        except (ZoneInfoNotFoundError,ValueError): fail(422,"validation_failed","Invalid timezone")
         hours=r.get("opening_hours",[])
         tables=r.get("tables",[])
-        if not isinstance(hours,list) or not isinstance(tables,list): fail(422,"validation_failed","Invalid restaurant configuration")
-        hmap={}
+        if not isinstance(hours,list) or not isinstance(tables,list): fail(400,"malformed_request","Opening hours and tables must be arrays")
         for h in hours:
-            if not isinstance(h,dict) or not string(h.get("weekday")) or h["weekday"] not in ("mon","tue","wed","thu","fri","sat","sun") or not string(h.get("opens")) or not string(h.get("closes")):
+            if not isinstance(h,dict): fail(400,"malformed_request","Invalid opening-hours object")
+            if any(k not in h for k in ("weekday","opens","closes")): fail(422,"validation_failed","Required opening-hours fields are missing")
+            if not all(string(h.get(k)) for k in ("weekday","opens","closes")): fail(400,"malformed_request","Invalid opening-hours field types")
+            if h["weekday"] not in ("mon","tue","wed","thu","fri","sat","sun"):
                 fail(422,"validation_failed","Invalid opening hours")
-            hmap[h["weekday"]]={"opens":h["opens"],"closes":h["closes"]}
+            try:
+                opens=dt.datetime.strptime(h["opens"],"%H:%M").strftime("%H:%M")
+                closes=dt.datetime.strptime(h["closes"],"%H:%M").strftime("%H:%M")
+            except Exception: fail(422,"validation_failed","Invalid opening-hours time")
+            if opens!=h["opens"] or closes!=h["closes"] or closes<=opens: fail(422,"validation_failed","Invalid opening-hours interval")
         for t in tables:
             if not isinstance(t,dict) or not all(string(t.get(k)) for k in ("id","label")) or not integer(t.get("capacity")):
                 fail(400,"malformed_request","Invalid table field types")
             if len(t["id"])>64:fail(422,"validation_failed","ID is too long")
-        try:
-            slot=int(r.get("slot_minutes",30));duration=int(r.get("reservation_duration_minutes",90));cutoff=int(r.get("cancellation_cutoff_minutes",60))
-        except Exception: fail(400,"malformed_request","Invalid restaurant configuration types")
+        numeric_fields=("slot_minutes","reservation_duration_minutes","cancellation_cutoff_minutes")
+        if any(k not in r for k in numeric_fields): fail(422,"validation_failed","Required restaurant settings are missing")
+        if any(not integer(r[k]) for k in numeric_fields): fail(400,"malformed_request","Invalid restaurant configuration types")
+        slot,duration,cutoff=(r[k] for k in numeric_fields)
         if min(slot,duration)<1 or cutoff<0: fail(422,"validation_failed","Invalid restaurant configuration")
-        c.execute("INSERT INTO restaurants VALUES(?,?,?,?,?,?,?,?)",(r["id"],r["name"],r["timezone"],slot,duration,cutoff,canon(hmap),canon(tables)))
+        c.execute("INSERT INTO restaurants VALUES(?,?,?,?,?,?,?,?)",(r["id"],r["name"],r["timezone"],slot,duration,cutoff,canon(hours),canon(tables)))
     reservations=data.get("reservations",[])
     if not isinstance(reservations,list):fail(400,"malformed_request","reservations must be an array")
     for b in reservations:
-        if not isinstance(b,dict): fail(422,"validation_failed","Invalid reservation fixture")
+        if not isinstance(b,dict): fail(400,"malformed_request","Invalid reservation object")
         user=c.execute("SELECT id FROM users WHERE id=?",(b.get("user_id"),)).fetchone()
         rest=c.execute("SELECT * FROM restaurants WHERE id=?",(b.get("restaurant_id"),)).fetchone()
         if not user or not rest: fail(422,"validation_failed","Invalid reservation fixture")
@@ -129,6 +158,10 @@ def seed(c,data):
 class Handler(BaseHTTPRequestHandler):
     server_version="Tablekeeper/1"
     def log_message(self,*args): pass
+    def send_error(self,code,message=None,explain=None):
+        status=404 if code==501 else code
+        error_code={400:"malformed_request",404:"not_found"}.get(status,"internal_error")
+        self.send_json(status,{"error":{"code":error_code,"message":message or "Request could not be handled"}})
     def send_json(self,status,data):
         raw=json.dumps(data,separators=(",",":"),ensure_ascii=False).encode()
         self._last_json=(status,data)
@@ -150,10 +183,10 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self):
         path=self.path.split("?",1)[0]
         method=self.command
-        with LOCK:
+        mutating=(method=="POST" and path in ("/_test/reset","/_test/import","/auth/signup","/reservations","/reservation-moves")) or (method=="PATCH") or (method=="POST" and path.endswith("/cancel"))
+        with (LOCK if mutating else nullcontext()):
             c=connect()
             try:
-                schema(c)
                 if method=="GET" and path=="/health": return self.send_json(200,{"status":"ok"})
                 if method=="POST" and path=="/_test/reset":
                     c.execute("BEGIN IMMEDIATE")
@@ -166,7 +199,9 @@ class Handler(BaseHTTPRequestHandler):
                     b=self.body();return self.auth_route(c,path,b)
                 if method=="GET" and path=="/restaurants": return self.send_json(200,{"restaurants":[{"id":r["id"],"name":r["name"],"timezone":r["timezone"]} for r in c.execute("SELECT * FROM restaurants ORDER BY rowid")]})
                 if method=="GET" and path.startswith("/restaurants/"):
-                    r=c.execute("SELECT * FROM restaurants WHERE id=?",(path.split("/")[-1],)).fetchone()
+                    rid=path.split("/")[-1]
+                    if len(rid)>64: fail(422,"validation_failed","ID is too long")
+                    r=c.execute("SELECT * FROM restaurants WHERE id=?",(rid,)).fetchone()
                     if not r: fail(404,"not_found","Restaurant not found")
                     return self.send_json(200,restaurant_view(r))
                 if method=="GET" and path=="/availability": return self.availability(c,None)
@@ -191,10 +226,13 @@ class Handler(BaseHTTPRequestHandler):
     def run_dispatch(self):
         try:self.dispatch()
         except ApiError as e:self.send_json(e.status,{"error":{"code":e.code,"message":e.message}})
+        except sqlite3.IntegrityError:self.send_json(422,{"error":{"code":"validation_failed","message":"Conflicting fixture or resource data"}})
         except Exception:self.send_json(500,{"error":{"code":"internal_error","message":"Internal server error"}})
     def auth_route(self,c,path,b):
         email,password,name=b.get("email"),b.get("password"),b.get("display_name")
-        if not all(string(x) for x in (email,password)) or (path.endswith("signup") and not string(name)): fail(400,"malformed_request","Invalid credentials field types")
+        required=("email","password","display_name") if path.endswith("signup") else ("email","password")
+        if any(k not in b for k in required): fail(422,"validation_failed","Required credentials are missing")
+        if not all(string(b.get(k)) for k in required): fail(400,"malformed_request","Invalid credentials field types")
         if path.endswith("signup"):
             if not email_valid(email): fail(422,"validation_failed","Invalid email")
             if len(password)<8: fail(422,"validation_failed","Password must contain at least 8 characters")
@@ -240,6 +278,7 @@ class Handler(BaseHTTPRequestHandler):
         q=parse_qs(urlsplit(self.path).query)
         rid=q.get("restaurant_id",[None])[0];date=q.get("date",[None])[0];ps=q.get("party_size",[None])[0]
         if rid is None or date is None or ps is None: fail(422,"validation_failed","restaurant_id, date and party_size are required")
+        if len(rid)>64: fail(422,"validation_failed","ID is too long")
         if not re.fullmatch(r"[0-9]+",ps):fail(422,"validation_failed","party_size must be an integer")
         party=int(ps)
         if party<1:fail(422,"validation_failed","party_size must be positive")
@@ -247,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
             parsed_date=dt.date.fromisoformat(date)
             if parsed_date.isoformat()!=date:raise ValueError()
         except Exception: fail(422,"validation_failed","date must be YYYY-MM-DD")
-        r=self.restaurant(c,rid);hours=json.loads(r["opening_hours"]);tables=json.loads(r["tables_json"]);zone=ZoneInfo(r["timezone"])
+        r=self.restaurant(c,rid);hours=hours_map(json.loads(r["opening_hours"]));tables=json.loads(r["tables_json"]);zone=ZoneInfo(r["timezone"])
         wd=dt.date.fromisoformat(date).strftime("%a").lower()[:3]
         h=hours.get(wd)
         slots=[]
@@ -257,12 +296,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:fail(422,"validation_failed","Invalid opening hours")
             cur=dt.datetime.combine(dt.date.fromisoformat(date),o);close=dt.datetime.combine(dt.date.fromisoformat(date),z)
             open_min=o.hour*60+o.minute
-            while cur+dt.timedelta(minutes=r["reservation_duration_minutes"])<=close:
+            close_aware=dt.datetime.combine(dt.date.fromisoformat(date),z,zone)
+            while cur<close:
                 local=cur.strftime("%Y-%m-%dT%H:%M")
                 # Exclude skipped wall-clock instants; keep first repeated instant only.
                 try:start=local_instant(local,r["timezone"])
                 except ApiError:cur+=dt.timedelta(minutes=r["slot_minutes"]);continue
                 end=local_end(start,r["reservation_duration_minutes"])
+                if end.astimezone(dt.timezone.utc)>close_aware.astimezone(dt.timezone.utc): break
                 free=[]
                 booked=list(c.execute("SELECT starts_at,ends_at,table_id FROM reservations WHERE restaurant_id=? AND status='confirmed'",(rid,)))
                 for t in tables:
@@ -275,19 +316,26 @@ class Handler(BaseHTTPRequestHandler):
     def validate_slot(self,c,uid,b,old=None,check_occupancy=True):
         rid=b.get("restaurant_id",old["restaurant_id"] if old else None)
         if old and rid!=old["restaurant_id"]:fail(422,"validation_failed","Reservation restaurant cannot change")
+        if old is None and "restaurant_id" not in b: fail(422,"validation_failed","restaurant_id is required")
+        if not string(rid): fail(400,"malformed_request","restaurant_id must be a string")
+        if len(rid)>64: fail(422,"validation_failed","ID is too long")
         r=self.restaurant(c,rid)
         table_id=b.get("table_id",old["table_id"] if old else None)
+        if old is None and "table_id" not in b: fail(422,"validation_failed","table_id is required")
+        if not string(table_id): fail(400,"malformed_request","table_id must be a string")
+        if len(table_id)>64: fail(422,"validation_failed","ID is too long")
         table=next((t for t in json.loads(r["tables_json"]) if t.get("id")==table_id),None)
         if not table:fail(404,"not_found","Table not found")
         local=b.get("starts_at_local",old["starts_at_local"] if old else None)
-        if not string(local):fail(422,"validation_failed","starts_at_local is required")
+        if old is None and "starts_at_local" not in b:fail(422,"validation_failed","starts_at_local is required")
+        if not string(local):fail(400,"malformed_request","starts_at_local must be a string")
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}",local):
             fail(422,"validation_failed","starts_at_local must be YYYY-MM-DDTHH:MM")
         start=local_instant(local,r["timezone"])
         party=b.get("party_size",old["party_size"] if old else None)
         if not integer(party) or party<1:fail(422,"validation_failed","party_size must be a positive integer")
         if party>table.get("capacity",0):fail(422,"party_exceeds_capacity","Party exceeds table capacity")
-        hours=json.loads(r["opening_hours"]);wd=start.strftime("%a").lower()[:3];h=hours.get(wd)
+        hours=hours_map(json.loads(r["opening_hours"]));wd=start.strftime("%a").lower()[:3];h=hours.get(wd)
         if not h:fail(422,"outside_opening_hours","Restaurant is closed")
         opening=dt.datetime.combine(start.date(),dt.datetime.strptime(h["opens"],"%H:%M").time(),start.tzinfo)
         close=dt.datetime.combine(start.date(),dt.datetime.strptime(h["closes"],"%H:%M").time(),start.tzinfo)
@@ -310,6 +358,9 @@ class Handler(BaseHTTPRequestHandler):
     def resview(self,r):
         return {k:r[k] for k in ("reservation_id","reference","restaurant_id","table_id","party_size","status","starts_at_local","starts_at","ends_at","created_at")} if "reservation_id" in r else {"reservation_id":r["id"],**{k:r[k] for k in ("reference","restaurant_id","table_id","party_size","status","starts_at_local","starts_at","ends_at","created_at")}}
     def cancel(self,c,uid,r):
+        c.execute("BEGIN IMMEDIATE")
+        r=c.execute("SELECT * FROM reservations WHERE id=? AND user_id=?",(r["id"],uid)).fetchone()
+        if not r:fail(404,"not_found","Reservation not found")
         if r["status"]=="cancelled":return self.send_json(200,self.resview(r))
         rest=self.restaurant(c,r["restaurant_id"])
         if instant(r["starts_at"])-dt.datetime.now(dt.timezone.utc)<=dt.timedelta(minutes=rest["cancellation_cutoff_minutes"]):fail(409,"cutoff_passed","Cancellation cutoff has passed")
@@ -317,20 +368,22 @@ class Handler(BaseHTTPRequestHandler):
         c.commit()
         nr=c.execute("SELECT * FROM reservations WHERE id=?",(r["id"],)).fetchone();return self.send_json(200,self.resview(nr))
     def amend(self,c,uid,r,b):
+        c.execute("BEGIN IMMEDIATE")
+        r=c.execute("SELECT * FROM reservations WHERE id=? AND user_id=?",(r["id"],uid)).fetchone()
+        if not r:fail(404,"not_found","Reservation not found")
         result=self.apply_amend(c,uid,r,b);c.commit()
         return self.send_json(200,result)
     def apply_amend(self,c,uid,r,b):
         if r["status"]=="cancelled":fail(409,"reservation_cancelled","Reservation is cancelled")
         rest=self.restaurant(c,r["restaurant_id"])
         if instant(r["starts_at"])-dt.datetime.now(dt.timezone.utc)<=dt.timedelta(minutes=rest["cancellation_cutoff_minutes"]):fail(409,"cutoff_passed","Amendment cutoff has passed")
-        merged={k:b.get(k,r[k]) for k in ("restaurant_id","table_id","starts_at_local","party_size")}
+        merged={"restaurant_id":r["restaurant_id"],**{k:b.get(k,r[k]) for k in ("table_id","starts_at_local","party_size")}}
         nr,tid,p,local,start,end=self.validate_slot(c,uid,merged,r)
         c.execute("UPDATE reservations SET table_id=?,party_size=?,starts_at_local=?,starts_at=?,ends_at=? WHERE id=?",(tid,p,local,start.isoformat(),end.isoformat(),r["id"]))
         return self.resview(c.execute("SELECT * FROM reservations WHERE id=?",(r["id"],)).fetchone())
     def moves(self,c,uid,b):
         moves=b.get("moves")
         if not isinstance(moves,list) or not 1<=len(moves)<=8:fail(422,"validation_failed","moves must contain 1 to 8 items")
-        c.execute("BEGIN IMMEDIATE")
         refs=[];rows=[]
         for m in moves:
             if not isinstance(m,dict) or not string(m.get("reference")):fail(422,"validation_failed","Each move requires a reference")
@@ -345,7 +398,7 @@ class Handler(BaseHTTPRequestHandler):
         for row,m in rows:
             if row["status"]=="cancelled":fail(409,"reservation_cancelled","Reservation is cancelled")
             if instant(row["starts_at"])-dt.datetime.now(dt.timezone.utc)<=dt.timedelta(minutes=rest["cancellation_cutoff_minutes"]):fail(409,"cutoff_passed","Amendment cutoff has passed")
-            merged={k:m.get(k,row[k]) for k in ("restaurant_id","table_id","starts_at_local","party_size")}
+            merged={"restaurant_id":row["restaurant_id"],**{k:m.get(k,row[k]) for k in ("table_id","starts_at_local","party_size")}}
             r,tid,p,local,start,end=self.validate_slot(c,uid,merged,row,check_occupancy=False)
             prepared.append((row,tid,p,local,start,end))
         # Validate all occupancy against the final set, ignoring listed old occupancy.
@@ -362,14 +415,13 @@ class Handler(BaseHTTPRequestHandler):
         for row,tid,p,local,start,end in prepared:
             c.execute("UPDATE reservations SET table_id=?,party_size=?,starts_at_local=?,starts_at=?,ends_at=? WHERE id=?",(tid,p,local,start.isoformat(),end.isoformat(),row["id"]))
             result.append(self.resview(c.execute("SELECT * FROM reservations WHERE id=?",(row["id"],)).fetchone()))
-        c.commit()
         return self.send_json(201,{"reservations":result})
     def send_raw_json(self,status,raw):
         data=raw.encode()
         self.send_response(status);self.send_header("Content-Type","application/json; charset=utf-8");self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
 
 def restaurant_view(r):
-    return {"id":r["id"],"name":r["name"],"timezone":r["timezone"],"slot_minutes":r["slot_minutes"],"reservation_duration_minutes":r["reservation_duration_minutes"],"cancellation_cutoff_minutes":r["cancellation_cutoff_minutes"],"opening_hours":json.loads(r["opening_hours"]),"tables":json.loads(r["tables_json"])}
+    return {"id":r["id"],"name":r["name"],"timezone":r["timezone"],"slot_minutes":r["slot_minutes"],"reservation_duration_minutes":r["reservation_duration_minutes"],"cancellation_cutoff_minutes":r["cancellation_cutoff_minutes"],"opening_hours":hours_array(json.loads(r["opening_hours"])),"tables":json.loads(r["tables_json"])}
 
 def export_state(c):
     state={}
@@ -393,6 +445,10 @@ def import_state(c,data):
     except Exception:
         c.rollback();fail(422,"validation_failed","Invalid export state")
 
+class HttpServer(ThreadingHTTPServer):
+    request_queue_size=128
+    daemon_threads=True
+
 if __name__=="__main__":
     c=connect();schema(c);c.close()
-    ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","8080"))),Handler).serve_forever()
+    HttpServer(("0.0.0.0",int(os.environ.get("PORT","8080"))),Handler).serve_forever()
