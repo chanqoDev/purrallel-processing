@@ -65,3 +65,21 @@ Earlier, an attempt against commit `68b5a0825501a0e3231316a6759b05674afbeeb1` re
 ## Remaining submission evidence
 
 Before submission, add or link the final BAND room export, a video recording that visibly includes the BAND Desktop room, and exact cost measurements if available. The desktop room view was reported unusable during this work, so a qualifying room recording has not been verified here. Do not claim those artifacts are complete until they have been checked.
+
+## Verified Stage 2 development checkpoint
+
+Final implementation revision: `c70558396df518b8447eff1b5287023640c24fbf`.
+
+The completed isolated harness report records:
+- Stage 1: 120/120 passed.
+- Stage 2: 25/25 passed, including 17 UI checks.
+- Zero failures, errors, skips, or deselections.
+- Highest contiguous passing stage: 2.
+
+Evidence: `evidence/harness-tablekeeper-stage2-verifier-c705583/`.
+Stage 2 plan: `plan.md`.
+Development continuation room: `ba043fc6-dc3d-4b23-b292-5d79befa4ded`.
+
+This development run included human permission approvals and runtime
+restarts. These passing results establish implementation correctness
+against the exercised checks, not a no-intervention autonomous run.
