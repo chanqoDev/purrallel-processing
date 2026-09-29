@@ -92,9 +92,16 @@
   let formRevision=0;
   let successfulResult=null;
   async function loadRestaurants() {
-    const data=await request("/restaurants");
-    restaurants=data.restaurants || [];
-    return restaurants;
+    for (let attempt=0;;attempt++) {
+      try {
+        const data=await request("/restaurants");
+        restaurants=data.restaurants || [];
+        return restaurants;
+      } catch(error) {
+        if (attempt>=1) throw error;
+        await new Promise(resolve=>setTimeout(resolve,150));
+      }
+    }
   }
   async function getRestaurant(id) {
     if (selectedRestaurant?.id===id) return selectedRestaurant;
@@ -276,7 +283,10 @@
     if (path==="/") {
       renderHome();
       try { await loadRestaurants(); renderHome(); }
-      catch(error) {app.innerHTML='<div class="status error">'+esc(error.message || "Restaurants are unavailable.")+'</div>';return;}
+      catch(error) {
+        const results=app.querySelector("#results-region");
+        if (results) results.innerHTML='<div class="status error" role="alert">'+esc(error.message || "Restaurants are temporarily unavailable. Please try again shortly.")+'</div>';
+      }
       return;
     }
     app.innerHTML='<section class="empty-state"><h1>That page isn’t here.</h1><a class="muted-link" href="/">Return to search</a></section>';
