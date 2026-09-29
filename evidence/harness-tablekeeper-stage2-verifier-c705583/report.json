@@ -1,0 +1,87 @@
+{
+  "revision": "c70558396df518b8447eff1b5287023640c24fbf",
+  "track": "tablekeeper",
+  "stages": {
+    "1": "pass",
+    "2": "pass"
+  },
+  "highest_contiguous": 2,
+  "started_at": "2026-09-29T10:40:41.223731+00:00",
+  "finished_at": "2026-09-29T10:42:39.953605+00:00",
+  "schema_version": 2,
+  "run_id": "ab919db6f6584de79b34143a02cbe5e8",
+  "mode": "isolated",
+  "provenance": "working-tree",
+  "state": "completed",
+  "pytest_args": [],
+  "suite_digest": "91f4007512983b527d0f60633e006572f9a3ac7ae4f903df22d13614656f6c06",
+  "checks": {
+    "1": {
+      "collected": 120,
+      "passed": 120,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "deselected": 0,
+      "xfailed": 0,
+      "files": {
+        "stage_1/test_health_reset_auth.py": {
+          "passed": 12,
+          "total": 12
+        },
+        "stage_1/test_reservations.py": {
+          "passed": 37,
+          "total": 37
+        },
+        "stage_1/test_restaurants_availability.py": {
+          "passed": 18,
+          "total": 18
+        },
+        "stage_1/test_retries_time_input.py": {
+          "passed": 20,
+          "total": 20
+        },
+        "stage_1/test_sample.py": {
+          "passed": 20,
+          "total": 20
+        },
+        "stage_1/test_seeded_state.py": {
+          "passed": 13,
+          "total": 13
+        }
+      }
+    },
+    "2": {
+      "collected": 25,
+      "passed": 25,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "deselected": 0,
+      "xfailed": 0,
+      "files": {
+        "stage_2/test_sample.py": {
+          "passed": 8,
+          "total": 8
+        },
+        "stage_2/test_ui.py": {
+          "passed": 17,
+          "total": 17
+        }
+      }
+    }
+  },
+  "overshoot": null,
+  "claimed_stage": "2",
+  "share": 1.0,
+  "upgrade_sources": {
+    "2": {
+      "folder": "/tmp/tablekeeper-stage2-c705583-review/stage-1",
+      "revision": "c70558396df518b8447eff1b5287023640c24fbf"
+    },
+    "3": {
+      "folder": "/tmp/tablekeeper-stage2-c705583-review/stage-2",
+      "revision": "c70558396df518b8447eff1b5287023640c24fbf"
+    }
+  }
+}
