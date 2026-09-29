@@ -216,6 +216,7 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self,status,data):
         raw=json.dumps(data,separators=(",",":"),ensure_ascii=False).encode()
         self._last_json=(status,data)
+        if getattr(self,"_defer_response",False):return
         self.send_response(status);self.send_header("Content-Type","application/json; charset=utf-8");self.send_header("Content-Length",str(len(raw)));self.end_headers();self.wfile.write(raw)
     def send_empty(self,status):
         self.send_response(status);self.send_header("Content-Length","0");self.end_headers()
@@ -331,14 +332,19 @@ class Handler(BaseHTTPRequestHandler):
                 if row["method"]!=method or row["path"]!=path or row["body"]!=body: fail(409,"idempotency_key_reuse","Idempotency key was used for a different request")
                 c.commit();return self.send_raw_json(200,row["response"])
             self._last_json=None
+            self._defer_response=True
             result=fn()
             status,response=self._last_json
             c.execute("INSERT INTO idem VALUES(?,?,?,?,?,?,?)",(uid,key,method,path,body,status,json.dumps(response,separators=(",",":"),ensure_ascii=False)))
             c.commit()
+            self._defer_response=False
+            self.send_raw_json(status,json.dumps(response,separators=(",",":"),ensure_ascii=False))
             return result
         except ApiError:
+            self._defer_response=False
             c.rollback();raise
         except Exception:
+            self._defer_response=False
             c.rollback();raise
     def restaurant(self,c,rid):
         r=c.execute("SELECT * FROM restaurants WHERE id=?",(rid,)).fetchone()
