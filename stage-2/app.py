@@ -256,7 +256,14 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         c.rollback();raise
                     c.commit();return self.send_empty(204)
-                if method=="GET" and path=="/_test/export": return self.send_json(200,export_state(c))
+                if method=="GET" and path=="/_test/export":
+                    # Keep every table query on one SQLite read snapshot. Without an
+                    # explicit transaction, concurrent writes between SELECTs could
+                    # produce a state that never existed as a whole.
+                    c.execute("BEGIN")
+                    snapshot=export_state(c)
+                    c.commit()
+                    return self.send_json(200,snapshot)
                 if method=="POST" and path=="/_test/import":
                     data=self.body(); import_state(c,data);return self.send_empty(204)
                 if method=="POST" and path in ("/auth/signup","/auth/login"):
@@ -448,6 +455,7 @@ class Handler(BaseHTTPRequestHandler):
         if r["status"]=="cancelled":fail(409,"reservation_cancelled","Reservation is cancelled")
         rest=self.restaurant(c,r["restaurant_id"])
         if instant(r["starts_at"])-dt.datetime.now(dt.timezone.utc)<=dt.timedelta(minutes=rest["cancellation_cutoff_minutes"]):fail(409,"cutoff_passed","Amendment cutoff has passed")
+        if "table_id" in b and "table_ids" in b:fail(422,"validation_failed","Use either table_id or table_ids")
         merged={"restaurant_id":r["restaurant_id"]}
         if "table_id" in b:merged["table_id"]=b["table_id"]
         elif "table_ids" in b:merged["table_ids"]=b["table_ids"]
